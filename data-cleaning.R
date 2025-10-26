@@ -1,4 +1,7 @@
-# set working directory for looking at the data file 
+# clear environment
+rm(list = ls())
+
+# set working directory for looking at the data file
 setwd("data")
 
 # call important or might be important libraries
@@ -52,20 +55,25 @@ data <- data %>%
 data <- data %>%
   select(-infos.Currency)
 
+
+# fill up missing slaesPrice.currency with "CHF" since everything is in swiss francs according to the specifications
+data$salesPrice.currency[is.na(data$salesPrice.currency)] <- "CHF"
+
+
 # transform column info.Category (remove URL part)
 data$infos.Category <- str_remove(data$infos.Category, "^/de/s1/producttype/")
 
 # normalize city names for better matching
 normalize_names <- function(x) {
-  x <- tolower(x)                              # alles klein
-  x <- trimws(x)                               # Leerzeichen an Rändern entfernen
-  x <- stringi::stri_trans_general(x, "Latin-ASCII")  # Umlaute & Akzente entfernen
+  x <- tolower(x)                              # set to lowercase
+  x <- trimws(x)                               # remove heading an trailing white spaces
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")  # remove umlauts and accents
   x <- gsub("\\bst[\\.]?\\b", "sankt", x)      # St. → sankt
   x <- gsub("\\bste[\\.]?\\b", "sainte", x)    # Ste. → sainte
   x <- gsub("\\bsaint[\\.]?\\b", "sankt", x)   # Saint → sankt
   x <- gsub("\\bsainte[\\.]?\\b", "sankt", x)  # Sainte → sankt
-  x <- gsub("[^a-z\\s]", "", x)                # nur Buchstaben + Leerzeichen behalten
-  x <- gsub("\\s+", " ", x)                    # doppelte Leerzeichen entfernen
+  x <- gsub("[^a-z\\s]", "", x)                # remove everything but chars and whitespaces
+  x <- gsub("\\s+", " ", x)                    # remove double whitespaces
   trimws(x)
 }
 
@@ -88,10 +96,10 @@ for (i in seq_len(nrow(data))) {
     filter(GDENAME_clean == city)
   
   if (nrow(match_row) == 1) {
-    data$vill_name[i]  <- match_row$GDENAME    # offizieller Gemeindename
-    data$mun_canton[i] <- match_row$GDEKTNA    # Kanton
+    data$vill_name[i]  <- match_row$GDENAME    # official municipal name
+    data$mun_canton[i] <- match_row$GDEKTNA    # canton
     data$mun_bfsnr[i]  <- match_row$GDENR      # BFS-Nr.
-    data$mun_nhits[i]  <- 1                    # Treffer markieren
+    data$mun_nhits[i]  <- 1                    # mark hits
   }
 }
 
@@ -112,7 +120,3 @@ data <- data %>%
 # save the cleaned data as new csv file
 write_csv(data, "DigitecLive_Cleaned.csv")
 # end of script
-
-
-
-
