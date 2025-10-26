@@ -1,5 +1,5 @@
 # set working directory for looking at the data file 
-setwd("/Users/timofahrenbruch/Projekte/BFH/sbd2_group13/data")
+setwd("data")
 
 # call important or might be important libraries
 library(readr)
@@ -29,7 +29,6 @@ diagnose_web_report(data)
 
 # check for duplicates
 sum(duplicated(data))     # how many?
-which(duplicated(data))   # which rows?
 # delete the duplicates
 data <- distinct(data)
 # verify that duplicates have been removed
@@ -56,23 +55,63 @@ data <- data %>%
 # transform column info.Category (remove URL part)
 data$infos.Category <- str_remove(data$infos.Category, "^/de/s1/producttype/")
 
+# normalize city names for better matching
+normalize_names <- function(x) {
+  x <- tolower(x)                              # alles klein
+  x <- trimws(x)                               # Leerzeichen an Rändern entfernen
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")  # Umlaute & Akzente entfernen
+  x <- gsub("\\bst[\\.]?\\b", "sankt", x)      # St. → sankt
+  x <- gsub("\\bste[\\.]?\\b", "sainte", x)    # Ste. → sainte
+  x <- gsub("\\bsaint[\\.]?\\b", "sankt", x)   # Saint → sankt
+  x <- gsub("\\bsainte[\\.]?\\b", "sankt", x)  # Sainte → sankt
+  x <- gsub("[^a-z\\s]", "", x)                # nur Buchstaben + Leerzeichen behalten
+  x <- gsub("\\s+", " ", x)                    # doppelte Leerzeichen entfernen
+  trimws(x)
+}
 
-# matching the data of missing mun_bfsnr, vill_name & mun_canton
-# show the problematic rows (where mun_bfsnr is missing or mun_nhits != 0)
-problematic <- data %>%
-  filter(mun_nhits != 1 | is.na(mun_bfsnr)) %>%
-  distinct(cityName, vill_name, mun_canton, mun_bfsnr, mun_nhits)
-head(problematic)
+# creating duplicated city name column for matching
+mun_data <- mun_data %>%
+  mutate(GDENAME_clean = normalize_names(GDENAME))
 
-# match the missing values with the official municipality data
+# normalize city names in data for matching where nhits != 1
+data <- data %>%
+  mutate(cityName_clean = if_else(
+    mun_nhits != 1,
+    normalize_names(cityName),
+    cityName
+  ))
 
+# matching with a loop
+for (i in seq_len(nrow(data))) {
+  city <- data$cityName_clean[i]
+  match_row <- mun_data %>%
+    filter(GDENAME_clean == city)
+  
+  if (nrow(match_row) == 1) {
+    data$vill_name[i]  <- match_row$GDENAME    # offizieller Gemeindename
+    data$mun_canton[i] <- match_row$GDEKTNA    # Kanton
+    data$mun_bfsnr[i]  <- match_row$GDENR      # BFS-Nr.
+    data$mun_nhits[i]  <- 1                    # Treffer markieren
+  }
+}
 
+# are there now less missing values in the data (in %)?
+miss_var_summary(data) %>%
+  arrange(desc(pct_miss))
+# --> only a minimal part less missing values...
 
+# delete the rows where nhits is still not 1 --> data loss is not that high...
+data <- data %>%
+  filter(mun_nhits == 1)
 
+# looking at outliers in the data
+# --> we will not look at outliers
+# looking at correlated features in the data
+# --> we will not look at correlated features
 
 # save the cleaned data as new csv file
 write_csv(data, "DigitecLive_Cleaned.csv")
-
+# end of script
 
 
 
