@@ -71,13 +71,31 @@ miss_var_summary(data) %>%
   arrange(desc(pct_miss))
 
 ############################ CITYNAMES ##############################
-# Further cleaning of names for entries without a unique match
-# (Normalizing both sources for consistent name comparison)
+# Reset mun_Nhits as we have our own match process
+data$mun_nhits <- 0
+
+# ----------------- JOIN WITH ID ---------------------
+# count total rows where cityName does not match any of GDENAME in mun_data
+sum(!data$cityName %in% mun_data$GDENAME)
+
+# join mun_bfsnr ID with GDENR in mun_data and write GDENAME of it to cityname_clean, kanton to canton and set nhits to 1
+data <- data %>%
+  left_join(mun_data, by = c("mun_bfsnr" = "GDENR")) %>%
+  mutate(cityName_clean = GDENAME,
+         canton = Kanton,
+         mun_nhits = 1) %>%
+  select(-GDENAME, -Kanton)
+
+# count total rows where cityName does not match any of GDENAME in mun_data
+sum(!data$cityName_clean %in% mun_data$GDENAME)
+
+# ----------------- NORMALIZE NAMES -----------------
+# function to normalize the names of both datasets to allow a join via name of the ones which could not be joined via id
 normalize_name <- function(name) {
-  # Replace 'saint-' or 'saint ' with 'ste. '
-  name <- gsub("\\bsaint[- ]", "ste. ", name, ignore.case = TRUE)
+  # Replace 'saint-' or 'saint ' with 'st. '
+  name <- gsub("\\bsaint[- ]", "st ", name, ignore.case = TRUE)
   # Replace 'sankt-' or 'sankt ' with 'st. '
-  name <- gsub("\\bsankt[- ]", "st. ", name, ignore.case = TRUE)
+  name <- gsub("\\bsankt[- ]", "st ", name, ignore.case = TRUE)
   # Replace German umlauts (lowercase and uppercase)
   name <- gsub("ä", "ae", name)
   name <- gsub("ö", "oe", name)
@@ -90,95 +108,44 @@ normalize_name <- function(name) {
   name <- str_replace_all(name, "ß", "ss")
   # Remove all non-alphabetic characters (keep only letters and spaces)
   name <- gsub("[^A-Za-z ]", "", name)
+  # Set to lowercase
+  name = tolower(name)
   return(name)
 }
 
 # normalize both datasets
 mun_data <- mun_data %>%
-  mutate(GDENAME_clean = normalize_name(GDENAME))
+  mutate(GDENAME_normalized = normalize_name(GDENAME))
 
 data <- data %>%
-  mutate(cityName_clean = normalize_name(cityName))
+  mutate(cityName_normalized = normalize_name(cityName))
 
-# count total rows where cityName does not match any of GDENAME in mun_data
-sum(!data$cityName %in% mun_data$GDENAME)
+# get the rows which will be updated (where mun_bfsnr is empty but normalized name matches)
+dataWhereNrEmptyAndNameMatch <- data %>%
+  filter(is.na(mun_bfsnr) & cityName_normalized %in% mun_data$GDENAME_normalized)
 
-# join mun_bfsnr ID with GDENR in mun_data and write GDENAME of it to cityname_clean
+# count the ammount of missing mun_nhits before joining via name
+sum(is.na(data$mun_bfsnr))
+
+# join and via name and write GDENR to mun_bfsnr, GDENAME to cityName_clean, kanton to canton and set nhits to 1
 data <- data %>%
-  left_join(mun_data, by = c("mun_bfsnr" = "GDENR")) %>%
-  mutate(cityName_clean = GDENAME) %>%
-  select(-GDENAME)
-
-# count total rows where cityName_clean match cityName
-sum(data$cityName == data$cityName_clean, na.rm = TRUE)
-
-# show how many rows where cityname and cityname_clean match after overwrite
-sum(data$cityName == data$cityName_clean, na.rm = TRUE)
-
-# show the percentage of missing values per variable
-miss_var_summary(data) %>%
-  arrange(desc(pct_miss))
-
-# number of different cityName entries per bfsnr
-bfs_name_counts <- data %>%
-  group_by(mun_bfsnr) %>%
-  summarise(
-    n_citynames = n_distinct(cityName, na.rm = TRUE),
-    examples = paste0(head(unique(cityName), 3), collapse = ", ")
-  ) %>%
-  arrange(desc(n_citynames))
-
-# join normalized names to assign bfsnr, canton, official name
-data <- data %>%
-  left_join(
-    mun_data %>% select(GDENR, GDENAME, GDEKTNA, GDENAME_clean),
-    by = c("cityName_clean" = "GDENAME_clean")
-  ) %>%
+  left_join(mun_data, by = c("cityName_normalized" = "GDENAME_normalized")) %>%
   mutate(
-    vill_name  = coalesce(vill_name, GDENAME),
-    mun_canton = coalesce(mun_canton, GDEKTNA.y),
-    mun_bfsnr  = coalesce(mun_bfsnr, GDENR)
-  ) %>%
-  select(-any_of(c("GDENAME", "GDEKTNA.x", "GDEKTNA.y", "GDENR", "cityName_clean", "GDENAME_clean")))
+    mun_bfsnr = if_else(is.na(mun_bfsnr), GDENR, mun_bfsnr),
+    cityName_clean = if_else(is.na(mun_bfsnr), GDENAME, cityName_clean),
+    canton = if_else(is.na(mun_bfsnr), Kanton, canton),
+    mun_nhits  = if_else(is.na(mun_bfsnr), 1, mun_nhits)
+  )
+  
+# count the ammount of missing mun_nhits before joining via name
+sum(is.na(data$mun_bfsnr))
 
-# number of different cityName entries per bfsnr
+# number of different cityName_clean entries per bfsnr
 bfs_name_counts <- data %>%
   group_by(mun_bfsnr) %>%
   summarise(
-    n_citynames = n_distinct(cityName, na.rm = TRUE),
-    examples = paste0(head(unique(cityName), 3), collapse = ", ")
-  ) %>%
-  arrange(desc(n_citynames))
-
-# count total rows where cityName does not match any of GDENAME in mun_data
-sum(!data$cityName %in% mun_data$GDENAME)
-
-# join mun_bfsnr ID with GDENR in mun_data and write GDENAME of it to cityname_clean
-data <- data %>%
-  left_join(mun_data, by = c("mun_bfsnr" = "GDENR")) %>%
-  mutate(cityName_clean = GDENAME) %>%
-  select(-GDENAME)
-
-# count total rows where cityName_clean match cityName
-sum(data$cityName == data$cityName_clean, na.rm = TRUE)
-
-# overwrite cityname with cityName_clean where mun_nhits == 1
-data <- data %>%
-  mutate(cityName = if_else(mun_nhits == 1, cityName_clean, cityName))
-
-# show how many rows where cityname and cityname_clean match after overwrite
-sum(data$cityName == data$cityName_clean, na.rm = TRUE)
-
-# show the percentage of missing values per variable
-miss_var_summary(data) %>%
-  arrange(desc(pct_miss))
-
-# number of different cityName entries per bfsnr
-bfs_name_counts <- data %>%
-  group_by(mun_bfsnr) %>%
-  summarise(
-    n_citynames = n_distinct(cityName, na.rm = TRUE),
-    examples = paste0(head(unique(cityName), 3), collapse = ", ")
+    n_citynames = n_distinct(cityName_clean, na.rm = TRUE),
+    examples = paste0(head(unique(cityName_clean), 3), collapse = ", ")
   ) %>%
   arrange(desc(n_citynames))
 
@@ -189,6 +156,14 @@ data <- data %>%
 # check remaining missing values
 miss_var_summary(data) %>%
   arrange(desc(pct_miss))
+
+# count where nhits 1
+sum(data$mun_nhits == 1)
+# 0 missing. -> not possible. there is still an error when setting the nhits value 
+
+
+
+
 
 # delete the rows where nhits is still not 1 --> data loss is not that high...
 data <- data %>%
