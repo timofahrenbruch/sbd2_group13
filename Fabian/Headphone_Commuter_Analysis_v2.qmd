@@ -1,0 +1,272 @@
+---
+title: "Headphone Sales and Public Transport Commuters"
+subtitle: "Correlation Analysis: Swiss Cantons 2024"
+author: "Fabian Locher"
+date: "November 6, 2025"
+format:
+  pdf:
+    number-sections: true
+    colorlinks: true
+    geometry: margin=2.5cm
+    fontsize: 11pt
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+# Research Question
+
+**Do cantons with higher public transport commuter rates purchase more headphones?**
+
+**Hypothesis**: Commuters use headphones during their daily travel on public transport. We expect cantons with higher percentages of public transport commuters to show higher headphone sales per capita.
+
+**Background**: In Switzerland, public transport usage varies significantly between cantons. Urban cantons like Zürich and Basel have high percentages of commuters using trains, trams, and buses (>40%), while rural cantons rely more on private vehicles (<20%). Headphones have become essential for commuters who listen to music, podcasts, or take calls during their daily travel. This analysis investigates whether this behavioral pattern is reflected in online retail data.
+
+\newpage
+
+# Data Collection and Preparation
+
+```{r setup, echo=FALSE}
+library(tidyverse)
+library(readr)
+library(corrplot)
+
+# Canton abbreviation to full name mapping
+canton_mapping <- c(
+  "ZH" = "Zürich", "BE" = "Bern", "LU" = "Luzern", "UR" = "Uri",
+  "SZ" = "Schwyz", "OW" = "Obwalden", "NW" = "Nidwalden", "GL" = "Glarus",
+  "ZG" = "Zug", "FR" = "Fribourg", "SO" = "Solothurn", "BS" = "Basel-Stadt",
+  "BL" = "Basel-Landschaft", "SH" = "Schaffhausen", 
+  "AR" = "Appenzell Ausserrhoden", "AI" = "Appenzell Innerrhoden", 
+  "SG" = "St. Gallen", "GR" = "Graubünden", "AG" = "Aargau", "TG" = "Thurgau", 
+  "TI" = "Ticino", "VD" = "Vaud", "VS" = "Valais", "NE" = "Neuchâtel", 
+  "GE" = "Geneva", "JU" = "Jura"
+)
+
+# Mapping for German canton names in Pendler.csv to match with sales data
+german_to_standard <- c(
+  "Freiburg" = "Fribourg",
+  "Tessin" = "Ticino", 
+  "Waadt" = "Vaud",
+  "Wallis" = "Valais",
+  "Neuenburg" = "Neuchâtel",
+  "Genf" = "Geneva"
+)
+
+# Load Public Transport Commuter Data & Population (2020-2024)
+commuter_data <- read_delim("Pendler.csv", delim = ";", skip = 2, 
+                            show_col_types = FALSE) %>%
+  select(
+    Canton = Bezeichnung, 
+    PT_Percent = `Modal Split der Pendler - Öffentlicher Verkehr  2020-2022`,
+    Population = `Ständige Wohnbevölkerung 2024`
+  ) %>%
+  mutate(
+    # Standardize German canton names to match sales data
+    Canton = ifelse(Canton %in% names(german_to_standard), 
+                   german_to_standard[Canton], 
+                   Canton),
+    PT_Percent = as.numeric(PT_Percent),
+    Population = as.numeric(Population)
+  )
+
+# Fill missing PT_Percent for Appenzell Innerrhoden with Ausserrhoden value
+ar_value <- commuter_data %>% 
+  filter(Canton == "Appenzell Ausserrhoden") %>% 
+  pull(PT_Percent)
+
+commuter_data <- commuter_data %>%
+  mutate(PT_Percent = ifelse(Canton == "Appenzell Innerrhoden", ar_value, PT_Percent))
+
+# Load Headphone Sales Data (Category: kopfhoerer-48)
+digitec <- read_csv("DigitecLive_Cleaned.csv", show_col_types = FALSE) %>%
+  mutate(Canton = canton_mapping[canton])
+
+headphones <- digitec %>%
+  filter(infos.Category == "kopfhoerer-48", !is.na(Canton)) %>%
+  count(Canton, name = "Headphone_Sales")
+
+# Merge datasets and calculate per capita sales
+analysis_data <- commuter_data %>%
+  inner_join(headphones, by = "Canton") %>%
+  mutate(Headphones_per_10k = (Headphone_Sales / Population) * 10000) %>%
+  arrange(desc(PT_Percent))
+```
+
+This dataset combines three key variables: 
+
+- **Public Transport Commuters**: Percentage of commuters using public transport (2020-2022)
+- **Headphone Sales**: Product category "kopfhoerer-48" from Digitec online retail
+- **Population**: Resident population by canton (2024)
+
+We calculate headphone sales per 10,000 residents to enable fair comparison between cantons of different sizes.
+
+**Data Summary:**
+
+```{r summary, echo=FALSE}
+cat("Number of cantons:", nrow(analysis_data), "\n")
+cat("Total headphone sales:", sum(analysis_data$Headphone_Sales), "\n")
+cat("PT commuter range:", round(min(analysis_data$PT_Percent), 1), "% -", 
+    round(max(analysis_data$PT_Percent), 1), "%\n")
+```
+
+\newpage
+
+# Statistical Analysis
+
+# Statistical Analysis
+
+## Correlation Test
+
+We use **Pearson correlation** to measure the linear relationship between public transport commuter percentage and headphone sales per capita.
+
+```{r correlation, echo=FALSE}
+# Pearson correlation test
+cor_test <- cor.test(analysis_data$PT_Percent, 
+                     analysis_data$Headphones_per_10k,
+                     method = "pearson")
+
+cat("Correlation coefficient (r):", round(cor_test$estimate, 3), "\n")
+cat("P-value:                    ", round(cor_test$p.value, 4), "\n")
+cat("95% Confidence Interval:     [", round(cor_test$conf.int[1], 3), ",", 
+    round(cor_test$conf.int[2], 3), "]\n\n")
+if(cor_test$p.value < 0.05) {
+  cat("✓ STATISTICALLY SIGNIFICANT (p < 0.05)\n")
+} else {
+  cat("✗ NOT statistically significant (p ≥ 0.05)\n")
+}
+```
+
+## Linear Regression
+
+We fit a **linear regression model** to quantify the relationship:
+
+```{r regression, echo=FALSE}
+# Linear regression model
+model <- lm(Headphones_per_10k ~ PT_Percent, data = analysis_data)
+
+cat("R² (explained variance):    ", round(summary(model)$r.squared, 3), "\n")
+cat("Adjusted R²:                ", round(summary(model)$adj.r.squared, 3), "\n")
+cat("Slope (β):                  ", round(coef(model)[2], 4), "\n")
+cat("Intercept:                  ", round(coef(model)[1], 4), "\n")
+```
+
+The R² value indicates how much of the variance in headphone sales can be explained by public transport commuter rates.
+
+## Correlation Matrix
+
+```{r correlation_matrix, echo=FALSE, fig.width=7, fig.height=5.5, fig.align='center'}
+# Correlation matrix with main variables
+cor_data <- analysis_data %>%
+  select(
+    `PT Commuters %` = PT_Percent, 
+    `Headphones per 10k` = Headphones_per_10k,
+    `Total Sales` = Headphone_Sales,
+    Population = Population
+  )
+
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  number.cex = 1.1,
+  tl.col = "black",
+  tl.srt = 45,
+  tl.cex = 1.0,
+  col = colorRampPalette(c("#A23B72", "white", "#2E86AB"))(200),
+  diag = FALSE,
+  mar = c(0,0,1,0)
+)
+```
+
+The correlation matrix visualizes relationships between all variables. Values range from -1 (perfect negative correlation) to +1 (perfect positive correlation).
+
+\newpage
+
+# Visualization
+
+```{r plot, echo=FALSE, fig.width=10, fig.height=6.5, fig.align='center'}
+ggplot(analysis_data, aes(x = PT_Percent, y = Headphones_per_10k)) +
+  geom_point(aes(size = Population), color = "#2E86AB", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", linewidth = 1.2) +
+  geom_text(aes(label = Canton), vjust = -0.8, size = 3, check_overlap = TRUE) +
+  labs(
+    title = "Headphone Sales vs. Public Transport Commuter Share",
+    subtitle = paste0("Category: kopfhoerer-48 | Total sales: ", 
+                     sum(analysis_data$Headphone_Sales)),
+    x = "Public Transport Commuters (%)",
+    y = "Headphones per 10,000 Residents",
+    size = "Population",
+    caption = "Data: Swiss Federal Statistical Office & Digitec online retail"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.position = "right",
+    plot.caption = element_text(size = 9, hjust = 1)
+  )
+```
+
+The scatter plot shows each canton as a point (size = population). The regression line indicates the overall trend, with the shaded area representing the 95% confidence interval.
+
+\newpage
+
+# Top Cantons by Headphones per 10k
+
+```{r top_cantons, echo=FALSE}
+# Top 5 and Bottom 5 cantons by normalized headphone sales (per 10k)
+top5 <- analysis_data %>%
+  select(Canton, PT_Percent, Headphone_Sales, Headphones_per_10k) %>%
+  arrange(desc(Headphones_per_10k)) %>%
+  slice_head(n = 5)
+
+bottom5 <- analysis_data %>%
+  select(Canton, PT_Percent, Headphone_Sales, Headphones_per_10k) %>%
+  arrange(Headphones_per_10k) %>%
+  slice_head(n = 5)
+```
+
+## Top 5 Cantons (Highest per capita sales)
+
+```{r top5_table, echo=FALSE}
+knitr::kable(
+  top5, 
+  col.names = c("Canton", "PT Commuters (%)", "Total Sales", "Per 10k Residents"), 
+  digits = 2,
+  align = c('l', 'r', 'r', 'r')
+)
+```
+
+## Bottom 5 Cantons (Lowest per capita sales)
+
+```{r bottom5_table, echo=FALSE}
+knitr::kable(
+  bottom5, 
+  col.names = c("Canton", "PT Commuters (%)", "Total Sales", "Per 10k Residents"), 
+  digits = 2,
+  align = c('l', 'r', 'r', 'r')
+)
+```
+
+These tables rank cantons by **normalized headphone sales per capita**. This controls for population size and reveals which cantons have the highest and lowest per-capita headphone demand.
+
+\newpage
+
+# Conclusion
+
+The analysis `r if(cor_test$p.value < 0.05) "reveals a **statistically significant**" else "does **not** reveal a statistically significant"` correlation between public transport commuter rates and headphone sales per capita (*r* = `r round(cor_test$estimate, 2)`, *p* = `r round(cor_test$p.value, 3)`). 
+
+`r if(cor_test$p.value < 0.05) paste0("The positive correlation coefficient (r = ", round(cor_test$estimate, 2), ") indicates that cantons with higher percentages of public transport commuters tend to purchase more headphones per capita, supporting our hypothesis that commuting behavior influences headphone demand. The linear regression model explains ", round(summary(model)$r.squared * 100, 1), "% of the variance in headphone sales.") else paste0("While we observe a correlation coefficient of r = ", round(cor_test$estimate, 2), ", this relationship is not statistically significant (p = ", round(cor_test$p.value, 3), "), meaning we cannot conclusively link public transport usage to headphone purchases based on this data. Other factors such as urbanization, income levels, or demographic composition may play more important roles.")`
+
+**Dataset Summary:**
+
+- Product Category: kopfhoerer-48 (headphones)
+- Total Sales: `r sum(analysis_data$Headphone_Sales)` units
+- Number of Cantons: `r nrow(analysis_data)`
+- Data Period: 2020-2024
+- Data Sources: Swiss Federal Statistical Office, Digitec online retail platform
