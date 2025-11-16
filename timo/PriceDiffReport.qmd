@@ -1,0 +1,1173 @@
+---
+title: "Price Diff Report"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+knitr::opts_chunk$set(
+fig.width = 8,
+fig.height = 5,
+fig.align = "center",
+warning = FALSE, 
+message = FALSE, 
+echo = TRUE
+)
+```
+
+# Data analysis for regional price differences
+
+### Load libraries
+
+```{r}
+library(readxl)
+library(here)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(plotly)
+library(stringr)
+library(furrr)
+library(cli)
+library(sf)
+library(leaflet)
+library(viridis)
+library(htmltools)
+library(geodata)
+```
+
+### Load and merge data
+
+```{r}
+digitec_data  <- read.csv(here("data", "DigitecLive_Cleaned.csv"))
+gemeinde_data <- read_xlsx(here("data", "Gemeindestand.xlsx"))
+
+merged_data <- digitec_data |>
+  left_join(
+    gemeinde_data |> select(Gemeindename, Bezirksname),
+    by = c("cityName_clean" = "Gemeindename")
+  )
+
+canton_lang_lookup <- tibble::tibble(
+  canton = c(
+    "AG","AR","AI","BS","BL","BE","FR","GE","GL",
+    "GR","JU","LU","NE","NW","OW","SH","SG","SZ",
+    "SO","TI","TG","UR","VS","VD","ZG","ZH"
+  ),
+  language_region = c(
+    "German",          # AG
+    "German",          # AR
+    "German",          # AI
+    "German",          # BS
+    "German",          # BL
+    "German/French",   # BE
+    "French/German",   # FR
+    "French",          # GE
+    "German",          # GL
+    "German/Italian",  # GR
+    "French",          # JU
+    "German",          # LU
+    "French",          # NE
+    "German",          # NW
+    "German",          # OW
+    "German",          # SH
+    "German",          # SG
+    "German",          # SZ
+    "German",          # SO
+    "Italian",         # TI
+    "German",          # TG
+    "German",          # UR
+    "French/German",   # VS
+    "French",          # VD
+    "German",          # ZG
+    "German"           # ZH
+  )
+)
+
+gemeinde_with_language <- gemeinde_data |>
+  left_join(canton_lang_lookup, by = c("Kanton" = "canton"))
+
+merged_data <- digitec_data |>
+  left_join(
+    gemeinde_with_language |> select(Gemeindename, Bezirksname, language_region),
+    by = c("cityName_clean" = "Gemeindename")
+  )
+```
+
+### Calculate the weighted average prices
+
+```{r}
+merged_with_weights <- merged_data |>
+  group_by(cityName_clean, infos.Category) |> mutate(purchases_municipality = n()) |> ungroup() |>
+  group_by(Bezirksname, infos.Category) |> mutate(purchases_district = n()) |> ungroup() |>
+  group_by(canton, infos.Category) |> mutate(purchases_canton = n()) |> ungroup() |>
+  group_by(language_region, infos.Category) |> mutate(purchases_language = n()) |> ungroup()
+
+avg_price_municipality <- merged_with_weights |>
+  group_by(cityName_clean, infos.Category) |>
+  summarise(avg_price = weighted.mean(salesPrice.amountIncl, w = purchases_municipality), .groups = "drop")
+
+avg_price_district <- merged_with_weights |>
+  group_by(Bezirksname, infos.Category) |>
+  summarise(avg_price = weighted.mean(salesPrice.amountIncl, w = purchases_district), .groups = "drop")
+
+avg_price_canton <- merged_with_weights |>
+  group_by(canton, infos.Category) |>
+  summarise(avg_price = weighted.mean(salesPrice.amountIncl, w = purchases_canton), .groups = "drop")
+
+avg_price_language <- merged_with_weights |>
+  group_by(language_region, infos.Category) |>
+  summarise(avg_price = weighted.mean(salesPrice.amountIncl, w = purchases_language), .groups = "drop")
+
+avg_price_overall <- merged_with_weights |>
+  group_by(infos.Category) |>
+  summarise(overall_avg_price = mean(salesPrice.amountIncl), .groups = "drop")
+
+price_stats <- list(
+  municipality = avg_price_municipality,
+  district     = avg_price_district,
+  canton       = avg_price_canton,
+  language     = avg_price_language,
+  overall      = avg_price_overall
+)
+```
+
+### Bootstrapping functions to calculate price differences
+
+```{r}
+bootstrap_mean_diff_fast <- function(
+    data,
+    group_var,
+    n_boot = 500,
+    min_obs_per_region = 5
+) {
+  region_levels <- unique(data[[group_var]])
+  if (length(region_levels) < 2) return(NULL)
+  
+  region_pairs <- combn(region_levels, 2, simplify = FALSE)
+  
+  map_dfr(region_pairs, function(pair) {
+    r1 <- pair[1]
+    r2 <- pair[2]
+    
+    prices1 <- data$salesPrice.amountIncl[data[[group_var]] == r1]
+    prices2 <- data$salesPrice.amountIncl[data[[group_var]] == r2]
+    
+    if (length(prices1) < min_obs_per_region || length(prices2) < min_obs_per_region) {
+      return(NULL)
+    }
+    
+    obs <- mean(prices1) - mean(prices2)
+    
+    n1 <- length(prices1)
+    n2 <- length(prices2)
+    
+    boot_mat1 <- matrix(sample(prices1, n1 * n_boot, replace = TRUE), n1, n_boot)
+    boot_mat2 <- matrix(sample(prices2, n2 * n_boot, replace = TRUE), n2, n_boot)
+    
+    boot_means1 <- colMeans(boot_mat1)
+    boot_means2 <- colMeans(boot_mat2)
+    boot_dist <- boot_means1 - boot_means2
+    
+    tibble(
+      region1 = r1,
+      region2 = r2,
+      observed_difference = obs,
+      lower_ci = quantile(boot_dist, 0.025),
+      upper_ci = quantile(boot_dist, 0.975),
+      p_value = mean(sign(boot_dist) != sign(obs)) * 2
+    )
+  })
+}
+
+run_region_bootstrap_parallel <- function(
+    data,
+    region_var,
+    n_boot = 500,
+    min_total_per_cat = 30,
+    max_regions_per_cat = 30,
+    min_obs_per_region = 5
+) {
+  region_summary <- data |>
+    filter(!is.na(.data[[region_var]])) |>
+    group_by(infos.Category) |>
+    summarise(
+      n_total   = n(),
+      n_regions = n_distinct(.data[[region_var]]),
+      .groups = "drop"
+    )
+  
+  valid_categories <- region_summary |>
+    filter(
+      n_total >= min_total_per_cat,
+      n_regions >= 2,
+      n_regions <= max_regions_per_cat
+    ) |> pull(infos.Category)
+  
+  category_list <- data |>
+    filter(
+      infos.Category %in% valid_categories,
+      !is.na(.data[[region_var]])
+    ) |>
+    group_by(infos.Category) |> group_split()
+  
+  cli::cli_inform(c("i" = paste0(
+    "Bootstrapping ", length(category_list),
+    " categories for region variable '", region_var, "'."
+  )))
+  
+  future_map_dfr(
+    category_list,
+    .progress = TRUE,
+    .options = furrr_options(seed = TRUE),   # FIXED RNG
+    function(df_cat) {
+      cat_name <- unique(df_cat$infos.Category)
+      
+      boot_res <- bootstrap_mean_diff_fast(
+        df_cat,
+        region_var,
+        n_boot = n_boot,
+        min_obs_per_region = min_obs_per_region
+      )
+      
+      if (is.null(boot_res) || nrow(boot_res) == 0) return(NULL)
+      
+      boot_res |>
+        mutate(category = cat_name) |>
+        relocate(category)
+    }
+  )
+}
+
+future::plan(future::multisession, workers = max(1, parallel::detectCores() - 1))
+```
+
+### Bootstrap language regions and get top significant differences
+
+```{r}
+all_language_boot <- run_region_bootstrap_parallel(
+  merged_data, "language_region", n_boot = 500, max_regions_per_cat = 10
+)
+
+significant_language_diffs <- all_language_boot |>
+  filter((lower_ci > 0 | upper_ci < 0) & p_value < 0.05) |>
+  mutate(direction = if_else(observed_difference > 0,
+                             "region1_more_expensive", "region2_more_expensive"))
+
+top10_language_diffs <- significant_language_diffs |>
+  mutate(abs_diff = abs(observed_difference)) |>
+  arrange(desc(abs_diff)) |> slice_head(n = 10) |> select(-abs_diff)
+```
+
+### Bootstrap cantons and get top significant differences
+
+```{r}
+all_canton_boot <- run_region_bootstrap_parallel(
+  merged_data, "canton", n_boot = 500, max_regions_per_cat = 26
+)
+
+significant_canton_diffs <- all_canton_boot |>
+  filter((lower_ci > 0 | upper_ci < 0) & p_value < 0.05) |>
+  mutate(direction = if_else(observed_difference > 0,
+                             "region1_more_expensive", "region2_more_expensive"))
+
+top10_canton_diffs <- significant_canton_diffs |>
+  mutate(abs_diff = abs(observed_difference)) |>
+  arrange(desc(abs_diff)) |> slice_head(n = 10) |> select(-abs_diff)
+```
+
+### Bootstrap districts and get top significant differences
+
+```{r}
+all_district_boot <- run_region_bootstrap_parallel(
+  merged_data, "Bezirksname", n_boot = 500, max_regions_per_cat = 30
+)
+
+significant_district_diffs <- all_district_boot |>
+  filter((lower_ci > 0 | upper_ci < 0) & p_value < 0.05) |>
+  mutate(direction = if_else(observed_difference > 0,
+                             "region1_more_expensive", "region2_more_expensive"))
+
+top10_district_diffs <- significant_district_diffs |>
+  mutate(abs_diff = abs(observed_difference)) |>
+  arrange(desc(abs_diff)) |> slice_head(n = 10) |> select(-abs_diff)
+```
+
+### Bootstrap municipalities and get top significant differences
+
+```{r}
+all_municipality_boot <- run_region_bootstrap_parallel(
+  merged_data, "cityName_clean", n_boot = 500, max_regions_per_cat = 30
+)
+
+significant_municipality_diffs <- all_municipality_boot |>
+  filter((lower_ci > 0 | upper_ci < 0) & p_value < 0.05) |>
+  mutate(direction = if_else(observed_difference > 0,
+                             "region1_more_expensive", "region2_more_expensive"))
+
+top10_municipality_diffs <- significant_municipality_diffs |>
+  mutate(abs_diff = abs(observed_difference)) |>
+  arrange(desc(abs_diff)) |> slice_head(n = 10) |> select(-abs_diff)
+```
+
+# Preparing visualizations of simple price differences (means) and expensiveness indexes for regions
+
+### Normalize language regions
+
+```{r}
+normalize_lang <- function(x) {
+  case_when(
+    x %in% c("German", "French", "Italian") ~ x,
+    x %in% c("German/French", "French/German") ~ "German-French",
+    x == "German/Italian" ~ "German-Italian",
+    TRUE ~ x
+  )
+}
+
+significant_language_diffs_norm <- significant_language_diffs |>
+  mutate(
+    region1 = normalize_lang(region1),
+    region2 = normalize_lang(region2)
+  )
+```
+
+### Calculate expensiveness index for language region and cantons
+
+```{r}
+compute_expensiveness_index <- function(sig_tbl, region_type_label) {
+  sig_tbl |>
+    mutate(
+      more_expensive = if_else(observed_difference > 0, region1, region2),
+      less_expensive = if_else(observed_difference > 0, region2, region1)
+    ) |>
+    select(category, more_expensive, less_expensive) |>
+    tidyr::pivot_longer(
+      cols = c(more_expensive, less_expensive),
+      names_to = "role",
+      values_to = "region"
+    ) |>
+    mutate(score = if_else(role == "more_expensive", 1, -1)) |>
+    group_by(region) |>
+    summarise(
+      expensiveness_index = sum(score),
+      n_comparisons = n(),
+      .groups = "drop"
+    ) |>
+    mutate(region_type = region_type_label)
+}
+
+exp_lang <- compute_expensiveness_index(
+  significant_language_diffs_norm,
+  "language_region"
+) |>
+  rename(language_region = region) |>
+  mutate(
+    expensiveness_index = replace_na(expensiveness_index, 0),
+    n_comparisons = replace_na(n_comparisons, 0)
+  )
+
+exp_cant <- compute_expensiveness_index(
+  significant_canton_diffs,
+  "canton"
+) |>
+  rename(region = region) |>   # Keep column name 'region' for canton codes
+  mutate(
+    expensiveness_index = replace_na(expensiveness_index, 0),
+    n_comparisons = replace_na(n_comparisons, 0)
+  )
+```
+
+### Calculate overall swiss mean vs. regional means for language regions and cantons
+
+```{r}
+overall_mean_price <- mean(merged_data$salesPrice.amountIncl, na.rm = TRUE)
+
+# --- 1a) Language regions -------------------------------------------------------
+avg_lang_simple <- merged_data %>%
+  mutate(language_region = normalize_lang(language_region)) %>%
+  filter(!is.na(language_region)) %>%
+  group_by(language_region) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(diff_from_overall = mean_price - overall_mean_price)
+
+p_lang_overall_simple <- ggplot(
+  avg_lang_simple,
+  aes(
+    x = reorder(language_region, mean_price),
+    y = mean_price,
+    fill = diff_from_overall,
+    text = paste(
+      "Language region:", language_region,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>vs Swiss mean:", round(diff_from_overall, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis(option = "C", name = "Δ vs Swiss mean") +
+  labs(
+    title = "Average price by language region vs Swiss mean",
+    x = NULL, y = "Mean price (CHF)"
+  ) +
+  theme_minimal(12)
+
+p_lang_overall_simple <- ggplotly(p_lang_overall_simple, tooltip = "text")
+
+
+# --- 1b) Cantons -------------------------------------------------------
+avg_canton_simple <- merged_data %>%
+  filter(!is.na(canton)) %>%
+  group_by(canton) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(diff_from_overall = mean_price - overall_mean_price)
+
+p_canton_overall_simple <- ggplot(
+  avg_canton_simple,
+  aes(
+    x = reorder(canton, mean_price),
+    y = mean_price,
+    fill = diff_from_overall,
+    text = paste(
+      "Canton:", canton,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>vs Swiss mean:", round(diff_from_overall, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis(option = "C", name = "Δ vs Swiss mean") +
+  labs(
+    title = "Average price by canton vs Swiss mean",
+    x = NULL, y = "Mean price (CHF)"
+  ) +
+  theme_minimal(12)
+
+p_canton_overall_simple <- ggplotly(p_canton_overall_simple, tooltip = "text")
+```
+
+### Get the top 10 categories by transaction volume and revenue
+
+```{r}
+# A) Top 10 by transaction volume
+top_categories_by_volume <- merged_data %>%
+  count(infos.Category, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 10) %>%
+  pull(infos.Category)
+
+# B) Top 10 by revenue
+top_categories_by_revenue <- merged_data %>%
+  mutate(revenue = salesPrice.amountIncl) %>%
+  group_by(infos.Category) %>%
+  summarise(
+    total_revenue = sum(revenue, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_revenue)) %>%
+  slice_head(n = 10) %>%
+  pull(infos.Category)
+```
+
+### Get the top 10 categories by transaction volume and revenue for regional differences (language region & cantons)
+
+```{r}
+# ------------------------ LANGUAGE REGION — VOLUME ---------------------
+lang_cat_volume <- merged_data %>%
+  mutate(language_region = normalize_lang(language_region)) %>%
+  filter(
+    !is.na(language_region),
+    infos.Category %in% top_categories_by_volume
+  ) %>%
+  group_by(infos.Category, language_region) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_lang_cat_volume <- ggplot(
+  lang_cat_volume,
+  aes(
+    x = language_region,
+    y = mean_price,
+    fill = language_region,
+    text = paste(
+      "Category:", infos.Category,
+      "<br>Language region:", language_region,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ infos.Category, scales = "free_x") +
+  scale_fill_viridis_d(option = "C") +
+  labs(
+    title = "Mean price by Language Region — Top 10 by Volume",
+    subtitle = "Categories ranked by transaction count",
+    x = "Language region", y = "Mean price (CHF)"
+  ) +
+  theme_minimal(11)
+
+p_lang_cat_volume <- ggplotly(p_lang_cat_volume, tooltip = "text")
+
+
+# ------------------------ LANGUAGE REGION — REVENUE ---------------------
+lang_cat_revenue <- merged_data %>%
+  mutate(language_region = normalize_lang(language_region)) %>%
+  filter(
+    !is.na(language_region),
+    infos.Category %in% top_categories_by_revenue
+  ) %>%
+  group_by(infos.Category, language_region) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_lang_cat_revenue <- ggplot(
+  lang_cat_revenue,
+  aes(
+    x = language_region,
+    y = mean_price,
+    fill = language_region,
+    text = paste(
+      "Category:", infos.Category,
+      "<br>Language region:", language_region,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ infos.Category, scales = "free_x") +
+  scale_fill_viridis_d(option = "C") +
+  labs(
+    title = "Mean price by Language Region — Top 10 by Revenue",
+    subtitle = "Categories ranked by total CHF revenue",
+    x = "Language region", y = "Mean price (CHF)"
+  ) +
+  theme_minimal(11)
+
+p_lang_cat_revenue <- ggplotly(p_lang_cat_revenue, tooltip = "text")
+
+
+# ------------------------------ CANTON — VOLUME -------------------------
+canton_cat_volume <- merged_data %>%
+  filter(
+    !is.na(canton),
+    infos.Category %in% top_categories_by_volume
+  ) %>%
+  group_by(infos.Category, canton) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_canton_cat_volume <- ggplot(
+  canton_cat_volume,
+  aes(
+    x = canton,
+    y = mean_price,
+    fill = canton,
+    text = paste(
+      "Category:", infos.Category,
+      "<br>Canton:", canton,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ infos.Category, scales = "free_x") +
+  scale_fill_viridis_d(option = "C") +
+  labs(
+    title = "Mean price by Canton — Top 10 by Volume",
+    subtitle = "Categories ranked by transaction count",
+    x = "Canton", y = "Mean price (CHF)"
+  ) +
+  theme_minimal(11)
+
+p_canton_cat_volume <- ggplotly(p_canton_cat_volume, tooltip = "text")
+
+
+# ------------------------------ CANTON — REVENUE -------------------------
+canton_cat_revenue <- merged_data %>%
+  filter(
+    !is.na(canton),
+    infos.Category %in% top_categories_by_revenue
+  ) %>%
+  group_by(infos.Category, canton) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_canton_cat_revenue <- ggplot(
+  canton_cat_revenue,
+  aes(
+    x = canton,
+    y = mean_price,
+    fill = canton,
+    text = paste(
+      "Category:", infos.Category,
+      "<br>Canton:", canton,
+      "<br>Mean price:", round(mean_price, 2),
+      "<br>n:", n
+    )
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ infos.Category, scales = "free_x") +
+  scale_fill_viridis_d(option = "C") +
+  labs(
+    title = "Mean price by Canton — Top 10 by Revenue",
+    subtitle = "Categories ranked by total CHF revenue",
+    x = "Canton", y = "Mean price (CHF)"
+  ) +
+  theme_minimal(11)
+
+p_canton_cat_revenue <- ggplotly(p_canton_cat_revenue, tooltip = "text")
+```
+
+### Prepare significant difference tables
+
+```{r}
+sig_list <- list(
+  language_region = significant_language_diffs_norm |>
+    mutate(region_type = "language_region"),
+  canton          = significant_canton_diffs   |>
+    mutate(region_type = "canton")
+)
+
+sig_list <- lapply(
+  sig_list,
+  function(df) df |>
+    mutate(
+      abs_diff = abs(observed_difference),
+      region_pair = paste(region1, "vs", region2)
+    )
+)
+```
+
+### Get top 20 rankings per region level (language region & canton)
+
+```{r}
+make_topN_plot <- function(df, region_label, N = 20) {
+  
+  topdf <- df |>
+    arrange(desc(abs_diff)) |>
+    slice_head(n = N)
+  
+  p <- ggplot(
+    topdf,
+    aes(
+      x = reorder(paste(category, region_pair, sep = " | "), abs_diff),
+      y = abs_diff,
+      fill = abs_diff,
+      text = paste(
+        "Category:", category,
+        "<br>Region pair:", region_pair,
+        "<br>Observed Δ:", round(observed_difference, 2),
+        "<br>CI:", paste0("[", round(lower_ci, 2), ", ", round(upper_ci, 2), "]"),
+        "<br>p:", signif(p_value, 3)
+      )
+    )
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_viridis(option = "C", guide = "none") +
+    labs(
+      x = NULL,
+      y = "Absolute price difference",
+      title = paste("Top", N, "price differences —", region_label)
+    ) +
+    theme_minimal(base_size = 11)
+  
+  ggplotly(p, tooltip = "text")
+}
+
+top20_lang <- make_topN_plot(sig_list$language_region, "Language regions")
+top20_cant <- make_topN_plot(sig_list$canton,          "Cantons")
+```
+
+### Calculate price distributions
+
+```{r}
+get_boot_table <- function(region_type) {
+  switch(
+    region_type,
+    "language_region" = all_language_boot,
+    "canton"          = all_canton_boot
+  )
+}
+
+plot_category_distribution <- function(category_name, region_type, region_var) {
+  
+  df <- merged_data |>
+    filter(
+      infos.Category == category_name,
+      !is.na(.data[[region_var]])
+    )
+  
+  p <- ggplot(
+    df,
+    aes(
+      x = .data[[region_var]],
+      y = salesPrice.amountIncl,
+      fill = .data[[region_var]],
+      text = paste("Region:", .data[[region_var]], "<br>Price:", salesPrice.amountIncl)
+    )
+  ) +
+    geom_violin(alpha = 0.4, color = NA) +
+    geom_boxplot(width = 0.2, outlier.alpha = 0.2, color = "black") +
+    coord_flip() +
+    scale_fill_viridis_d(option = "C", guide = "none") +
+    labs(
+      x = region_type,
+      y = "Price (CHF)",
+      title = paste("Price distribution by", region_type, "for category:", category_name)
+    ) +
+    theme_minimal()
+  
+  ggplotly(p, tooltip = "text")
+}
+
+plot_category_bootstrap_ci <- function(category_name, region_type, region_var) {
+  
+  boot_tbl <- get_boot_table(region_type) |>
+    filter(category == category_name)
+  
+  if (nrow(boot_tbl) == 0) return(NULL)
+  
+  region_scores <- boot_tbl |>
+    mutate(
+      more_expensive = if_else(observed_difference > 0, region1, region2),
+      less_expensive = if_else(observed_difference > 0, region2, region1)
+    ) |>
+    select(more_expensive, less_expensive) |>
+    pivot_longer(cols = everything(), names_to = "role", values_to = "region") |>
+    mutate(score = if_else(role == "more_expensive", 1, -1)) |>
+    group_by(region) |>
+    summarise(net_score = sum(score), .groups = "drop")
+  
+  p <- ggplot(
+    region_scores,
+    aes(
+      x = reorder(region, net_score),
+      y = net_score,
+      fill = net_score,
+      text = paste("Region:", region, "<br>Score:", net_score)
+    )
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_viridis(option = "C", guide = "none") +
+    labs(
+      x = region_var,
+      y = "Bootstrap expensiveness score",
+      title = paste("Relative expensiveness for:", category_name)
+    ) +
+    theme_minimal()
+  
+  ggplotly(p, tooltip = "text")
+}
+
+# EXAMPLE category story (based on canton differences)
+example_category    <- "smartphone-24"
+example_dist_plot   <- plot_category_distribution(example_category, "canton", "canton")
+example_ci_plot     <- plot_category_bootstrap_ci(example_category, "canton", "canton")
+```
+
+### Expensiveness Index plots for language regions and cantons
+
+```{r}
+plot_exp_index <- function(df, label, region_col) {
+  
+  df <- df |> rename(region_name = {{ region_col }})
+  
+  p <- ggplot(
+    df,
+    aes(
+      x = reorder(region_name, expensiveness_index),
+      y = expensiveness_index,
+      fill = expensiveness_index,
+      text = paste(
+        "Region:", region_name,
+        "<br>Index:", expensiveness_index,
+        "<br>Comparisons:", n_comparisons
+      )
+    )
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_viridis(option = "C", guide = "none") +
+    labs(
+      title = paste("Expensiveness index —", label),
+      x = NULL,
+      y = "Expensiveness index"
+    ) +
+    theme_minimal()
+  
+  ggplotly(p, tooltip = "text")
+}
+
+exp_lang_plot <- plot_exp_index(exp_lang, "Language regions", language_region)
+exp_cant_plot <- plot_exp_index(exp_cant, "Cantons", region)
+```
+
+### Calculate map of expensiveness index for cantons
+
+```{r}
+exp_cant_coded <- exp_cant |>
+  rename(canton = region) |>
+  mutate(
+    expensiveness_index = replace_na(expensiveness_index, 0),
+    n_comparisons = replace_na(n_comparisons, 0)
+  )
+
+che_cantons <- geodata::gadm("CHE", level = 1, path = tempdir()) |>
+  st_as_sf()
+
+canton_name_lookup <- tibble::tribble(
+  ~canton, ~NAME_1,
+  "AG","Aargau","AI","Appenzell Innerrhoden","AR","Appenzell Ausserrhoden",
+  "BE","Bern","BL","Basel-Landschaft","BS","Basel-Stadt","FR","Fribourg",
+  "GE","Genève","GL","Glarus","GR","Graubünden","JU","Jura","LU","Lucerne",
+  "NE","Neuchâtel","NW","Nidwalden","OW","Obwalden","SG","Sankt Gallen",
+  "SH","Schaffhausen","SO","Solothurn","SZ","Schwyz","TG","Thurgau",
+  "TI","Ticino","UR","Uri","VD","Vaud","VS","Valais","ZG","Zug","ZH","Zürich"
+)
+
+exp_cant_fixed <- canton_name_lookup |>
+  left_join(exp_cant_coded, by = "canton")
+
+che_cantons_joined <- che_cantons |>
+  left_join(canton_name_lookup, by = "NAME_1") |>
+  left_join(exp_cant_fixed,  by = "canton")
+
+pal_canton <- colorNumeric(
+  palette = viridis(256),
+  domain  = che_cantons_joined$expensiveness_index
+)
+
+leaflet_canton_exp <- leaflet(che_cantons_joined) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal_canton(expensiveness_index),
+    fillOpacity = 0.8,
+    weight = 1,
+    color = "#555555",
+    label = ~lapply(
+      paste0(
+        "<b>", canton, "</b><br>",
+        "Expensiveness index: ", expensiveness_index, "<br>",
+        "Comparisons: ", n_comparisons
+      ),
+      htmltools::HTML
+    ),
+    highlightOptions = highlightOptions(weight = 3, color = "black")
+  ) |>
+  addLegend(
+    pal = pal_canton,
+    values = ~expensiveness_index,
+    title = "Canton Expensiveness Index"
+  )
+```
+
+### Calculate map of expensiveness index for language regions
+
+```{r}
+canton_lang_clean <- canton_lang_lookup |>
+  mutate(language_region = normalize_lang(language_region)) |>
+  select(canton, language_region)
+
+che_lang_base <- che_cantons_joined |>
+  select(canton, geometry) |>
+  distinct(canton, .keep_all = TRUE)
+
+che_lang <- che_lang_base |>
+  left_join(canton_lang_clean, by = "canton")
+
+che_lang_joined <- che_lang |>
+  left_join(exp_lang, by = "language_region")
+
+lang_regions <- che_lang_joined |>
+  group_by(language_region, expensiveness_index, n_comparisons) |>
+  summarise(geometry = st_union(geometry), .groups = "drop") |>
+  st_as_sf()
+
+pal_lang <- colorNumeric(
+  palette = viridis(256),
+  domain  = lang_regions$expensiveness_index
+)
+
+leaflet_language_exp <- leaflet(lang_regions) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal_lang(expensiveness_index),
+    fillOpacity = 0.8,
+    weight = 1,
+    color = "#333333",
+    label = ~lapply(
+      paste0(
+        "<b>", language_region, "</b><br>",
+        "Expensiveness index: ", expensiveness_index, "<br>",
+        "Comparisons: ", n_comparisons
+      ),
+      htmltools::HTML
+    ),
+    highlightOptions = highlightOptions(weight = 3, color = "black")
+  ) |>
+  addLegend(
+    pal = pal_lang,
+    values = ~expensiveness_index,
+    title = "Language Region Expensiveness Index"
+  )
+```
+
+### Calculate map of mean price for language regions
+
+```{r}
+avg_lang_simple_map <- merged_data %>%
+  mutate(language_region = normalize_lang(language_region)) %>%
+  filter(!is.na(language_region)) %>%
+  group_by(language_region) %>%
+  summarise(
+    mean_price = mean(salesPrice.amountIncl, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+canton_lang_clean_simple <- canton_lang_lookup %>%
+  mutate(language_region = normalize_lang(language_region)) %>%
+  select(canton, language_region)
+
+che_lang_mean_base <- che_cantons %>%
+  left_join(canton_name_lookup, by = "NAME_1") %>%
+  select(canton, geometry) %>%
+  distinct(canton, .keep_all = TRUE) %>%
+  left_join(canton_lang_clean_simple, by = "canton")
+
+che_lang_mean_joined <- che_lang_mean_base %>%
+  left_join(avg_lang_simple_map, by = "language_region")
+
+lang_mean_regions <- che_lang_mean_joined %>%
+  group_by(language_region, mean_price, n) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  st_as_sf()
+
+pal_lang_mean <- colorNumeric(
+  palette = viridis(256),
+  domain  = lang_mean_regions$mean_price
+)
+
+leaflet_language_mean_price <- leaflet(lang_mean_regions) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor = ~pal_lang_mean(mean_price),
+    fillOpacity = 0.8,
+    weight = 1,
+    color = "#333333",
+    label = ~lapply(
+      paste0(
+        "<b>", language_region, "</b><br>",
+        "Mean price: ", round(mean_price, 2), " CHF<br>",
+        "Transactions: ", n
+      ),
+      htmltools::HTML
+    ),
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal_lang_mean,
+    values = ~mean_price,
+    title = "Mean price per language region (CHF)"
+  )
+```
+
+### Calculate map for mean price of cantons
+
+```{r}
+che_cantons_mean <- che_cantons %>%
+  left_join(canton_name_lookup, by = "NAME_1") %>%
+  left_join(avg_canton_simple, by = "canton")
+
+pal_canton_mean <- colorNumeric(
+  palette = viridis(256),
+  domain  = che_cantons_mean$mean_price
+)
+
+leaflet_canton_mean_price <- leaflet(che_cantons_mean) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor = ~pal_canton_mean(mean_price),
+    fillOpacity = 0.8,
+    weight = 1,
+    color = "#555555",
+    label = ~lapply(
+      paste0(
+        "<b>", canton, "</b><br>",
+        "Mean price: ", round(mean_price, 2), " CHF<br>",
+        "Transactions: ", n
+      ),
+      htmltools::HTML
+    ),
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal_canton_mean,
+    values = ~mean_price,
+    title = "Mean price per canton (CHF)"
+  )
+```
+
+# Plotting the visualizations
+
+### Plot the overall price differences of the means
+
+```{r}
+p_lang_overall_simple
+```
+
+Time for storytelling
+
+```{r}
+p_canton_overall_simple
+```
+
+Time for storytelling
+
+### Plot the top 10 categories by transaction volume and revenue for language regions and cantons
+
+```{r}
+p_lang_cat_volume
+```
+
+Time for storytelling
+
+```{r}
+p_lang_cat_revenue
+```
+
+Time for storytelling
+
+```{r}
+p_canton_cat_volume
+```
+
+Time for storytelling
+
+```{r}
+p_canton_cat_revenue
+```
+
+Time for storytelling
+
+### Plot the maps of mean prices for language regions and cantons
+
+```{r}
+leaflet_language_mean_price
+```
+
+Time for storytelling
+
+```{r}
+leaflet_canton_mean_price
+```
+
+Time for storytelling
+
+### Plot the top 20 price differences in between categories for language regions and cantons
+
+```{r}
+top20_lang
+```
+
+Time for storytelling
+
+```{r}
+top20_cant
+```
+
+Time for storytelling
+
+### Plot price distributions and price intervals for chosen example category
+
+##### In here, you can choose your preferred category to display
+
+```{r}
+example_category    <- "smartphone-24"
+```
+
+```{r}
+example_dist_plot
+```
+
+Time for storytelling
+
+```{r}
+example_ci_plot
+```
+
+Time for storytelling
+
+### Plot the expensiveness index for language regions and cantons
+
+```{r}
+exp_lang_plot
+```
+
+Time for storytelling
+
+```{r}
+exp_cant_plot
+```
+
+Time for storytelling
+
+### Plot the expensiveness index map for language regions and cantons
+
+```{r}
+leaflet_language_exp
+```
+
+Time for storytelling
+
+```{r}
+leaflet_canton_exp
+```
+
+Time for storytelling
