@@ -1,0 +1,722 @@
+---
+title: "Temporal Patterns in Digitec purchases"
+subtitle: "Shopping Behavior Analysis Across Time Periods"
+author: "Nicola Fricker"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 10
+    fig-height: 6
+    theme: cosmo
+    self-contained: true
+editor: visual
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = 'center',
+  out.width = '100%'
+)
+```
+
+---
+
+# Setup
+
+```{r load-libraries}
+# Load required libraries
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(forcats)
+library(plotly)
+library(viridis)
+```
+
+## Load Data
+
+```{r read-data}
+# Read Digitec data
+data <- read_csv("../Data/DigitecLive_Cleaned.csv", show_col_types = FALSE)
+```
+
+## Load Population Data
+
+Population data taken from: \
+<https://mapexplorer.bfs.admin.ch/#c=indicator&i=ch_01_02_01a.staendigepop&s=2023&view=map164>
+
+```{r read-population}
+# Read population CSV
+population <- read.csv(
+  "StaendigeBevoelkerungKantone2023.csv",
+  sep = ";",
+  skip = 2,
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Rename columns
+population <- population %>%
+  rename(canton = Bezeichnung, count = Ständige.Wohnbevölkerung.2023) %>%
+  select(canton, count)
+
+# Convert count to numeric
+population <- population %>%
+  mutate(count = as.numeric(gsub("[^0-9]", "", count)))
+
+# Canton abbreviation to full name mapping
+canton_mapping <- c(
+  "ZH" = "Zürich", "BE" = "Bern", "LU" = "Luzern", "UR" = "Uri",
+  "SZ" = "Schwyz", "OW" = "Obwalden", "NW" = "Nidwalden", "GL" = "Glarus",
+  "ZG" = "Zug", "FR" = "Freiburg", "SO" = "Solothurn", "BS" = "Basel-Stadt",
+  "BL" = "Basel-Landschaft", "SH" = "Schaffhausen", "AR" = "Appenzell Ausserrhoden",
+  "AI" = "Appenzell Innerrhoden", "SG" = "St. Gallen", "GR" = "Graubünden",
+  "AG" = "Aargau", "TG" = "Thurgau", "TI" = "Tessin", "VD" = "Waadt",
+  "VS" = "Wallis", "NE" = "Neuenburg", "GE" = "Genf", "JU" = "Jura"
+)
+
+# Match canton abbreviations to full names
+population <- population %>%
+  mutate(canton = names(canton_mapping)[match(canton, canton_mapping)])
+
+# Calculate total population
+total_population <- sum(population$count)
+```
+
+## Setup Theme and Colors
+
+```{r setup-theme}
+# Viridis color palette
+viridis_colors <- viridis(256)
+CANTON_COLOR <- viridis_colors[150]
+NATIONAL_COLOR <- viridis_colors[200]
+PEAK_COLOR <- viridis_colors[50]
+
+# Weekday colors - explicitly map to weekdays
+weekday_colors <- c(
+  "Monday" = viridis_colors[30],
+  "Tuesday" = viridis_colors[70],
+  "Wednesday" = viridis_colors[110],
+  "Thursday" = viridis_colors[150],
+  "Friday" = viridis_colors[190],
+  "Saturday" = viridis_colors[220],
+  "Sunday" = viridis_colors[250]
+)
+
+# Unified theme function for plotly
+apply_theme <- function(fig, title) {
+  fig %>%
+    layout(
+      title = list(text = title, font = list(size = 14, color = "#2C3E50")),
+      paper_bgcolor = "#F8F9FA",
+      plot_bgcolor = "#FFFFFF",
+      font = list(family = "Arial", size = 10, color = "#2C3E50"),
+      margin = list(t = 50, b = 50, l = 50, r = 40)
+    )
+}
+```
+
+---
+
+# Day of Month Analysis
+
+## Data Preparation
+
+```{r day-of-month-prep}
+# Create day column
+data <- data %>%
+  mutate(day = day(dateTime))
+
+# Count purchases per canton and day
+canton_days <- data %>%
+  group_by(canton, day) %>%
+  summarise(purchases = n(), .groups = "drop")
+
+# Join with population data and calculate per 1000 citizens
+canton_day_relative <- canton_days %>%
+  left_join(population, by = "canton") %>%
+  mutate(purchases_per_1000 = (purchases / count) * 1000) %>%
+  group_by(canton) %>%
+  mutate(
+    total_purchases = sum(purchases, na.rm = TRUE),
+    rel_purchases = (purchases / total_purchases) * 100
+  ) %>%
+  ungroup()
+
+# Calculate national average per 1000 citizens
+national_total_by_day <- data %>%
+  group_by(day) %>%
+  summarise(day_purchases = n(), .groups = "drop") %>%
+  mutate(purchases_per_1000 = (day_purchases / total_population) * 1000)
+
+# Identify peak days per canton (based on per 1000 citizens)
+peak_points <- canton_day_relative %>%
+  group_by(canton) %>%
+  slice_max(order_by = purchases_per_1000, n = 1, with_ties = FALSE) %>%
+  ungroup()
+```
+
+## Daily Purchase Patterns by Canton
+
+```{r day-patterns-plot, fig.height=10}
+ggplot(canton_day_relative, aes(x = day, y = purchases_per_1000)) +
+  # Canton line (same color for all)
+  geom_line(aes(linetype = "Canton"), color = CANTON_COLOR, size = 1) +
+  geom_point(color = CANTON_COLOR, show.legend = FALSE) +
+  # National average
+  geom_line(
+    data = national_total_by_day,
+    aes(x = day, y = purchases_per_1000, linetype = "National Average"),
+    color = NATIONAL_COLOR,
+    size = 0.8
+  ) +
+  # Peak days
+  geom_point(
+    data = peak_points,
+    aes(x = day, y = purchases_per_1000, shape = "Peak Day"),
+    color = PEAK_COLOR,
+    size = 3
+  ) +
+  scale_linetype_manual(
+    name = "", 
+    values = c("Canton" = "solid", "National Average" = "solid")
+  ) +
+  scale_shape_manual(name = "", values = c("Peak Day" = 16)) +
+  scale_x_continuous(breaks = seq(1, 31, by = 5)) +
+  labs(
+    title = "Daily Purchases per 1000 Citizens by Canton",
+    subtitle = "With national average and peak days per canton",
+    x = "Day of Month",
+    y = "Purchases per 1000 Citizens"
+  ) +
+  facet_wrap(~ canton, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 8),
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(size = 8, angle = 0),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  ) +
+  guides(
+    linetype = guide_legend(
+      order = 1,
+      override.aes = list(color = c(CANTON_COLOR, NATIONAL_COLOR), size = 1)
+    ),
+    shape = guide_legend(order = 2)
+  )
+```
+
+---
+
+# Weekday Analysis
+
+## Data Preparation
+
+```{r weekday-prep}
+# Add weekday column
+data$day_name <- weekdays(as.Date(data$dateTime))
+
+# Count purchases per canton and weekday
+canton_weekdays <- data %>%
+  group_by(canton, day_name) %>%
+  summarise(purchases = n(), .groups = "drop")
+
+# Order weekdays
+canton_weekdays$day_name <- factor(
+  canton_weekdays$day_name, 
+  levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+)
+
+# Calculate purchases per 1000 citizens
+canton_weekday_relative <- canton_weekdays %>%
+  left_join(population, by = "canton") %>%
+  mutate(purchases_per_1000 = (purchases / count) * 1000) %>%
+  group_by(canton) %>%
+  mutate(
+    total_purchases = sum(purchases, na.rm = TRUE),
+    rel_purchases = (purchases / total_purchases) * 100
+  ) %>%
+  ungroup()
+
+# Identify peak weekdays per canton
+weekday_peak_points <- canton_weekday_relative %>%
+  group_by(canton) %>%
+  slice_max(order_by = purchases_per_1000, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Compute national average
+avg_weekday_relative_national <- canton_weekday_relative %>%
+  group_by(day_name) %>%
+  summarise(avg_rel_purchases = mean(rel_purchases, na.rm = TRUE))
+
+# Order days
+weekday_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", 
+                   "Friday", "Saturday", "Sunday")
+
+canton_weekday_relative$day_name <- factor(
+  canton_weekday_relative$day_name,
+  levels = weekday_order
+)
+
+avg_weekday_relative_national$day_name <- factor(
+  avg_weekday_relative_national$day_name,
+  levels = weekday_order
+)
+
+# Expand national line for all cantons
+avg_weekday_relative_national_expanded <- avg_weekday_relative_national %>%
+  crossing(canton = unique(canton_weekday_relative$canton))
+```
+
+## Weekly Purchase Patterns by Canton
+
+```{r weekday-patterns-plot, fig.height=10}
+ggplot(canton_weekday_relative, 
+       aes(x = day_name, y = rel_purchases, group = canton)) +
+  # Canton relative line
+  geom_line(aes(linetype = "Canton"), color = CANTON_COLOR, size = 1) +
+  geom_point(color = CANTON_COLOR, size = 2, show.legend = FALSE) +
+  # National average line
+  geom_line(
+    data = avg_weekday_relative_national_expanded,
+    aes(x = day_name, y = avg_rel_purchases, group = canton, linetype = "National Average"),
+    color = NATIONAL_COLOR,
+    size = 0.8,
+    inherit.aes = FALSE
+  ) +
+  # Canton peak day 
+  geom_point(
+    data = weekday_peak_points,
+    aes(x = day_name, y = rel_purchases, shape = "Peak Day"),
+    color = PEAK_COLOR,
+    size = 3
+  ) +
+  scale_linetype_manual(
+    name = "", 
+    values = c("Canton" = "solid", "National Average" = "solid")
+  ) +
+  scale_shape_manual(name = "", values = c("Peak Day" = 16)) +
+  labs(
+    title = "Weekly Purchase Patterns by Canton",
+    subtitle = "Each canton normalized by total weekly purchases; yellow line shows national average",
+    x = "Day of Week",
+    y = "Share of Weekly Purchases (%)"
+  ) +
+  facet_wrap(~ canton, scales = "fixed") +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 8),
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  ) +
+  guides(
+    linetype = guide_legend(
+      order = 1,
+      override.aes = list(color = c(CANTON_COLOR, NATIONAL_COLOR), size = 1)
+    ),
+    shape = guide_legend(order = 2)
+  )
+```
+
+**Finding:** Every peak day of the week in every canton is Friday with no exception. Let's examine Friday more closely.
+
+---
+
+# Whats happening on Friday?
+
+## Hourly Analysis - When Exactly Do People Shop?
+
+```{r friday-hourly-prep}
+# Filter Friday data and extract hour
+friday_data <- data %>%
+  filter(weekdays(as.Date(dateTime)) == "Friday") %>%
+  mutate(hour = hour(dateTime))
+
+# Count purchases per hour on Friday
+friday_hours <- friday_data %>%
+  group_by(hour) %>%
+  summarise(purchases = n(), .groups = "drop")
+
+# Calculate relative purchases per canton per hour
+canton_relative <- friday_data %>%
+  group_by(canton, hour) %>%
+  summarise(purchases = n(), .groups = "drop") %>%
+  left_join(population, by = "canton") %>%
+  mutate(purchases_per_1000 = (purchases / count) * 1000) %>%
+  group_by(canton) %>%
+  mutate(
+    total_purchases = sum(purchases, na.rm = TRUE),
+    rel_purchases = (purchases / total_purchases) * 100
+  ) %>%
+  ungroup()
+
+# Compute national average
+avg_relative <- canton_relative %>%
+  group_by(hour) %>%
+  summarise(
+    avg_rel_purchases = mean(rel_purchases, na.rm = TRUE),
+    avg_purchases_per_1000 = mean(purchases_per_1000, na.rm = TRUE)
+  )
+
+# Identify peak hours per canton
+peak_points <- canton_relative %>%
+  group_by(canton) %>%
+  slice_max(order_by = rel_purchases, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Convert hour to angle for polar plot
+peak_points <- peak_points %>%
+  mutate(
+    theta = hour * 15,  # 360° / 24h = 15° per hour
+    r = purchases_per_1000
+  )
+```
+
+## Peak Shopping Hours
+
+```{r friday-hourly-plot, fig.height=7}
+fig <- plot_ly(peak_points,
+               type = 'scatterpolar',
+               r = ~r,
+               theta = ~theta,
+               mode = 'markers+text',
+               marker = list(
+                 size = 15,
+                 color = ~r,
+                 colorscale = 'Viridis',
+                 showscale = TRUE,
+                 colorbar = list(title = "Intensity<br>(per 1000)"),
+                 line = list(color = 'white', width = 2)
+               ),
+               text = ~canton,
+               textposition = 'top center',
+               textfont = list(size = 9),
+               hovertext = ~paste0("Canton: ", canton, "<br>",
+                                  "Peak Hour: ", hour, ":00<br>",
+                                  "Purchases per 1000: ", round(purchases_per_1000, 2)),
+               hoverinfo = 'text') %>%
+  layout(
+    title = list(
+      text = "Peak Shopping Hours on Friday - 24h Clock View",
+      font = list(size = 14, color = "#2C3E50")
+    ),
+    polar = list(
+      radialaxis = list(
+        title = "Purchases per 1000",
+        visible = TRUE
+      ),
+      angularaxis = list(
+        tickmode = 'array',
+        tickvals = seq(0, 345, 15),
+        ticktext = paste0(0:23, ":00"),
+        direction = 'clockwise',
+        rotation = 90
+      )
+    ),
+    paper_bgcolor = "#F8F9FA"
+  )
+
+fig
+```
+
+---
+
+# Comparison with Other Weekdays
+
+## Spending Analysis
+
+```{r spending-comparison-prep}
+# Prepare data with price
+data <- data %>%
+  mutate(
+    price = as.numeric(`salesPrice.amountIncl`),
+    day_name = factor(day_name, levels = c("Monday", "Tuesday", "Wednesday", 
+                                            "Thursday", "Friday", "Saturday", "Sunday"))
+  )
+
+# Calculate spending per weekday
+weekday_spending <- data %>%
+  filter(!is.na(price)) %>%
+  group_by(day_name) %>%
+  summarise(
+    total_spent = sum(price, na.rm = TRUE),
+    n_purchases = n(),
+    avg_price = mean(price, na.rm = TRUE),
+    median_price = median(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    spending_per_1000 = (total_spent / total_population) * 1000,
+    purchases_per_1000 = (n_purchases / total_population) * 1000
+  )
+```
+
+## Total Spending per 1000 by Weekday
+
+```{r spending-by-weekday, fig.height=6}
+fig1 <- plot_ly(weekday_spending,
+               x = ~day_name,
+               y = ~spending_per_1000,
+               type = 'bar',
+               color = ~day_name,
+               colors = weekday_colors,
+               marker = list(
+                 line = list(color = 'white', width = 2)
+               ),
+               text = ~paste0("CHF ", round(spending_per_1000, 2)),
+               textposition = 'outside',
+               hovertext = ~paste0(day_name, "<br>",
+                                  "Spending per 1000: CHF ", round(spending_per_1000, 2), "<br>",
+                                  "Avg Price: CHF ", round(avg_price, 2), "<br>",
+                                  "Purchases per 1000: ", round(purchases_per_1000, 2), "<br>",
+                                  "Total Spent: CHF ", format(round(total_spent, 2), big.mark = ",")),
+               hoverinfo = 'text',
+               showlegend = FALSE) %>%
+  apply_theme("Total Spending per 1000 by Weekday") %>%
+  layout(
+    xaxis = list(title = "Day of Week"),
+    yaxis = list(title = "Spending per 1000 Citizens (CHF)")
+  )
+
+fig1
+```
+
+**Finding:** Total spending per 1000 people is significantly higher on Friday due to increased purchase volume.
+
+## Average Purchase Price by Weekday
+
+```{r avg-price-by-weekday, fig.height=6}
+fig3 <- plot_ly(weekday_spending,
+               x = ~day_name,
+               y = ~avg_price,
+               type = 'bar',
+               color = ~day_name,
+               colors = weekday_colors,
+               marker = list(
+                 line = list(color = 'white', width = 2)
+               ),
+               text = ~paste0("CHF ", round(avg_price, 2)),
+               textposition = 'outside',
+               hovertext = ~paste0(day_name, "<br>",
+                                  "Avg Price: CHF ", round(avg_price, 2), "<br>",
+                                  "Median Price: CHF ", round(median_price, 2)),
+               hoverinfo = 'text',
+               showlegend = FALSE) %>%
+  apply_theme("Average Purchase Price by Weekday") %>%
+  layout(
+    xaxis = list(title = "Day of Week"),
+    yaxis = list(title = "Average Price (CHF)")
+  )
+
+fig3
+```
+
+**Finding:** Average price does not vary significantly across the week, with Friday being only slightly higher than other days.
+
+---
+
+## Canton-Level Friday Spending Multipliers
+
+```{r canton-spending-ratios-prep}
+# Calculate spending per canton per weekday
+canton_weekday_spending <- data %>%
+  filter(!is.na(price)) %>%
+  group_by(canton, day_name) %>%
+  summarise(
+    total_spent = sum(price, na.rm = TRUE),
+    n_purchases = n(),
+    avg_price = mean(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(population, by = "canton") %>%
+  mutate(
+    spending_per_1000 = (total_spent / count) * 1000,
+    purchases_per_1000 = (n_purchases / count) * 1000
+  )
+
+# Calculate ratios per canton
+canton_spending_ratios <- canton_weekday_spending %>%
+  group_by(canton) %>%
+  mutate(
+    friday_spending = spending_per_1000[day_name == "Friday"],
+    spending_ratio = friday_spending / spending_per_1000,
+    spending_difference = friday_spending - spending_per_1000
+  ) %>%
+  ungroup() %>%
+  filter(day_name != "Friday")
+
+# Find top 5 biggest differences
+top5_differences <- canton_spending_ratios %>%
+  arrange(desc(spending_ratio)) %>%
+  head(5) %>%
+  mutate(
+    rank = row_number(),
+    label = paste0("#", rank, ": ", canton, " - ", day_name, 
+                  " (", round(spending_ratio, 2), "x)")
+  )
+```
+
+## Top 5 Biggest Friday Spending Multipliers
+
+```{r top5-spending-multipliers, fig.height=6}
+fig_top5 <- plot_ly(top5_differences,
+               y = ~reorder(label, spending_ratio),
+               x = ~spending_ratio,
+               type = 'bar',
+               orientation = 'h',
+               color = ~day_name,
+               colors = weekday_colors,
+               marker = list(
+                 line = list(color = 'white', width = 2)
+               ),
+               text = ~paste0(round(spending_ratio, 2), "x"),
+               textposition = 'outside',
+               textfont = list(size = 12),
+               hovertext = ~paste0("Rank: #", rank, "<br>",
+                                  "Canton: ", canton, "<br>",
+                                  "Compared to: ", day_name, "<br>",
+                                  "Friday is ", round(spending_ratio, 2), "x higher<br>",
+                                  "Difference: +CHF ", round(spending_difference, 2), " per 1000<br>",
+                                  "<br>",
+                                  "Friday: CHF ", round(friday_spending, 2), " per 1000<br>",
+                                  day_name, ": CHF ", round(spending_per_1000, 2), " per 1000"),
+               hoverinfo = 'text',
+               showlegend = FALSE) %>%
+  apply_theme("Top 5 Biggest Friday Spending Multipliers") %>%
+  layout(
+    yaxis = list(title = ""),
+    xaxis = list(title = "Spending Ratio (Friday / Other Day)"),
+    margin = list(l = 200)
+  )
+
+fig_top5
+```
+
+---
+
+## Category Analysis
+
+```{r category-analysis-prep}
+# Get top categories
+top_categories <- data %>%
+  count(infos.Category, sort = TRUE) %>%
+  head(5) %>%
+  pull(infos.Category)
+
+# Calculate purchases per category per weekday
+category_weekday_purchases <- data %>%
+  filter(infos.Category %in% top_categories) %>%
+  group_by(infos.Category, day_name) %>%
+  summarise(n_purchases = n(), .groups = "drop") %>%
+  mutate(purchases_per_1000 = (n_purchases / total_population) * 1000)
+
+# Calculate ratios compared to Friday
+category_purchase_ratios <- category_weekday_purchases %>%
+  group_by(infos.Category) %>%
+  mutate(
+    friday_purchases = purchases_per_1000[day_name == "Friday"],
+    purchase_ratio = friday_purchases / purchases_per_1000,
+    purchase_difference = friday_purchases - purchases_per_1000
+  ) %>%
+  ungroup() %>%
+  filter(day_name != "Friday")
+
+# Find top 5 categories with highest Friday boost
+top5_category_differences <- category_purchase_ratios %>%
+  arrange(desc(purchase_ratio)) %>%
+  head(5) %>%
+  mutate(
+    rank = row_number(),
+    label = paste0("#", rank, ": ", infos.Category, " vs ", day_name, 
+                  " (", round(purchase_ratio, 2), "x)")
+  )
+```
+
+## Friday Purchase Multiplier by Category
+
+```{r category-heatmap, fig.height=7}
+fig_heatmap_categories <- plot_ly(
+  category_purchase_ratios,
+  x = ~day_name,
+  y = ~infos.Category,
+  z = ~purchase_ratio,
+  type = 'heatmap',
+  colorscale = list(
+    c(0, "#440154"),      # Dark purple for low values
+    c(0.3, "#31688E"),    # Blue
+    c(0.5, "#35B779"),    # Green
+    c(0.75, "#FDE724"),   # Yellow
+    c(1, "#FDE724")       # Bright yellow
+  ),
+  zmin = min(category_purchase_ratios$purchase_ratio, na.rm = TRUE),
+  zmax = max(category_purchase_ratios$purchase_ratio, na.rm = TRUE),
+  text = ~paste0(round(purchase_ratio, 2), "x"),
+  texttemplate = '%{text}',
+  textfont = list(size = 8, color = "white"),
+  hovertext = ~paste0("Category: ", infos.Category, "<br>",
+                     "Day: ", day_name, "<br>",
+                     "Friday is ", round(purchase_ratio, 2), "x this day<br>",
+                     "Friday: ", round(friday_purchases, 2), " per 1000<br>",
+                     day_name, ": ", round(purchases_per_1000, 2), " per 1000"),
+  hoverinfo = 'text',
+  colorbar = list(
+    title = "Friday<br>Multiplier",
+    tickmode = "linear",
+    dtick = 0.2
+  )
+) %>%
+  apply_theme("Friday Purchase Multiplier by Category") %>%
+  layout(
+    xaxis = list(
+      title = "Day of Week",
+      categoryorder = "array",
+      categoryarray = c("Monday", "Tuesday", "Wednesday", "Thursday", "Saturday", "Sunday")
+    ),
+    yaxis = list(title = "Category")
+  )
+
+fig_heatmap_categories
+```
+
+---
+
+# Summary
+
+## Key Findings
+
+1.  **Peak Shopping Days:**
+    -   Every canton shows Friday as the peak shopping day without exception
+    -   Peak hours on Friday vary by canton but generally cluster around afternoon to evening
+2.  **Spending Patterns:**
+    -   Total spending per 1000 citizens is significantly higher on Friday
+    -   Average purchase price remains relatively stable across weekdays
+    -   Friday premium is driven by purchase volume, not price increases
+3.  **Regional Differences:**
+    -   Substantial variation in Friday multipliers across cantons
+    -   Top 5 canton-day combinations show Friday spending 2-3x higher than comparison days
+4.  **Category Behavior:**
+    -   Different product categories show varying sensitivity to the Friday effect
+    -   Some categories demonstrate stronger weekly patterns than others
